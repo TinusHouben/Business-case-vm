@@ -11,7 +11,8 @@
     "build:frontend": "cd frontend && npm run build",
     "test": "jest",
     "lint": "eslint src/**/*.ts",
-    "get-refresh-token": "ts-node scripts/get-refresh-token.ts"
+    "get-refresh-token": "ts-node scripts/get-refresh-token.ts",
+    "backup:customers": "ts-node scripts/backup-customers.ts"
   },
   "keywords": [
     "rabbitmq",
