@@ -33,7 +33,55 @@ export type MessageResponse = {
   data: any;
 };
 
+export type Candy = {
+  id: string;
+  name: string;
+  description: string;
+  pricePer100g: number;
+  category: string;
+  image?: string;
+};
+
+export type CandyOrderRequest = {
+  basket: Array<{
+    candyId: string;
+    quantity: number; // aantal keer 100g
+  }>;
+  customerInfo: {
+    name: string;
+    email: string;
+    phone?: string;
+    address?: string;
+    city?: string;
+    postalCode?: string;
+    customerId?: string;
+  };
+};
+
 class ApiClient {
+  async getCandies(): Promise<{ success: boolean; candies: Candy[]; total: number }> {
+    const response = await fetch(`${API_BASE_URL}/api/candies`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch candies');
+    }
+    return response.json();
+  }
+
+  async createCandyOrder(order: CandyOrderRequest): Promise<MessageResponse> {
+    const response = await fetch(`${API_BASE_URL}/api/orders/candy`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(order),
+    });
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'Failed to create candy order');
+    }
+    return response.json();
+  }
+
   async getQueueInfo(): Promise<QueueInfo> {
     const response = await fetch(`${API_BASE_URL}/queue/info`);
     if (!response.ok) {
