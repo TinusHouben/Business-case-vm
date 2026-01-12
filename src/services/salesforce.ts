@@ -22,9 +22,19 @@ interface OrderPayload {
   currency: string;
   items: Array<{
     productId: string;
-    quantity: number;
-    price: number;
+    productName?: string;
+    quantity: number; // aantal keer 100g
+    price: number; // prijs per 100g
+    totalPrice?: number; // totale prijs voor deze item
   }>;
+  customerInfo?: {
+    name: string;
+    email: string;
+    phone?: string;
+    address?: string;
+    city?: string;
+    postalCode?: string;
+  };
 }
 
 export class SalesforceService {
@@ -268,15 +278,25 @@ export class SalesforceService {
         throw error;
       }
 
+      // Maak een beschrijving met snoepjes details
+      const itemsDescription = order.items.map(item => {
+        const candyName = item.productName || item.productId;
+        const weight = item.quantity * 100; // quantity is in 100g units
+        return `${candyName}: ${weight}g (€${item.totalPrice?.toFixed(2) || (item.price * item.quantity).toFixed(2)})`;
+      }).join('\n');
+
+      const totalWeight = order.items.reduce((sum, item) => sum + (item.quantity * 100), 0);
+      const description = `Snoepjes Bestelling\n\n${itemsDescription}\n\nTotaal: ${totalWeight}g - €${order.amount.toFixed(2)}`;
+
       const opportunityData = {
-        Name: `Order ${order.id}`,
+        Name: `Snoepjes Order ${order.id}`,
         AccountId: accountId,
         Amount: order.amount,
         StageName: 'Closed Won',
         CloseDate: new Date().toISOString().split('T')[0],
         CurrencyIsoCode: order.currency || 'EUR',
         ExternalId__c: order.id,
-        Description: `Order with ${order.items.length} items`,
+        Description: description,
       };
 
       try {
