@@ -14,6 +14,9 @@ export const config = {
     instanceUrl: process.env.SALESFORCE_INSTANCE_URL || '',
     clientId: process.env.SALESFORCE_CLIENT_ID || '',
     clientSecret: process.env.SALESFORCE_CLIENT_SECRET || '',
+    refreshToken: process.env.SALESFORCE_REFRESH_TOKEN || '',
+    apiVersion: process.env.SALESFORCE_API_VERSION || 'v60.0',
+    // Legacy username/password support (optioneel, voor backward compatibility)
     username: process.env.SALESFORCE_USERNAME || '',
     password: process.env.SALESFORCE_PASSWORD || '',
     securityToken: process.env.SALESFORCE_SECURITY_TOKEN || '',
@@ -32,9 +35,16 @@ const requiredEnvVars = [
   'SALESFORCE_INSTANCE_URL',
   'SALESFORCE_CLIENT_ID',
   'SALESFORCE_CLIENT_SECRET',
-  'SALESFORCE_USERNAME',
-  'SALESFORCE_PASSWORD',
 ];
+
+// Refresh token of username/password moet aanwezig zijn
+const hasRefreshToken = process.env.SALESFORCE_REFRESH_TOKEN && process.env.SALESFORCE_REFRESH_TOKEN.length > 0;
+const hasUsernamePassword = process.env.SALESFORCE_USERNAME && process.env.SALESFORCE_PASSWORD && 
+                            process.env.SALESFORCE_USERNAME.length > 0 && process.env.SALESFORCE_PASSWORD.length > 0;
+
+if (!hasRefreshToken && !hasUsernamePassword) {
+  requiredEnvVars.push('SALESFORCE_REFRESH_TOKEN of SALESFORCE_USERNAME/PASSWORD');
+}
 
 export function validateConfig(): void {
   const missing = requiredEnvVars.filter(
