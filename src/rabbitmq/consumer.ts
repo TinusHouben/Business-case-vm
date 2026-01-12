@@ -3,16 +3,16 @@ import { RabbitMQMessage } from '../types/message';
 import { config } from '../config';
 import logger from '../utils/logger';
 import { isMessageProcessed, markMessageProcessed } from '../utils/idempotency';
-import { SalesforceService } from '../services/salesforce';
+import { SalesforceClient, OrderMessage } from '../services/salesforce-client';
 
 export class RabbitMQConsumer {
   private connection: amqp.Connection | null = null;
   private channel: amqp.Channel | null = null;
-  private salesforceService: SalesforceService;
+  private salesforceClient: SalesforceClient;
   private isProcessing = false;
 
-  constructor(salesforceService: SalesforceService) {
-    this.salesforceService = salesforceService;
+  constructor(salesforceClient: SalesforceClient) {
+    this.salesforceClient = salesforceClient;
   }
 
   async connect(): Promise<void> {
@@ -109,20 +109,27 @@ export class RabbitMQConsumer {
     try {
       await this.handleMessage(message);
       markMessageProcessed(messageId, 'success');
+      // ACK - bericht succesvol verwerkt
       this.channel.ack(msg);
       logger.info('Consumer: Message processed successfully', { messageId });
     } catch (error: any) {
       logger.error('Consumer: Failed to process message', {
         messageId,
         error: error.message,
+        statusCode: error.statusCode,
+        isHerhaalbaar: error.isHerhaalbaar,
       });
 
+      const isHerhaalbaar = error.isHerhaalbaar !== undefined ? error.isHerhaalbaar : true;
       const retryCount = (message.retryCount || 0) + 1;
-      if (retryCount < config.rabbitmq.maxRetries) {
-        logger.info('Consumer: Retrying message', {
+
+      // Als het een herhaalbare fout is en we hebben nog retries over
+      if (isHerhaalbaar && retryCount < config.rabbitmq.maxRetries) {
+        logger.info('Consumer: Retrying message (herhaalbare fout)', {
           messageId,
           retryCount,
           maxRetries: config.rabbitmq.maxRetries,
+          statusCode: error.statusCode,
         });
 
         message.retryCount = retryCount;
@@ -131,8 +138,19 @@ export class RabbitMQConsumer {
           persistent: true,
           messageId: message.messageId,
         });
+        // ACK het originele bericht (het wordt opnieuw in de queue gezet)
         this.channel.ack(msg);
+      } else if (!isHerhaalbaar) {
+        // Permanente fout (400, 4xx) - NACK zonder requeue
+        logger.error('Consumer: Permanente fout - geen retry', {
+          messageId,
+          error: error.message,
+          statusCode: error.statusCode,
+        });
+        this.channel.nack(msg, false, false); // requeue = false
+        markMessageProcessed(messageId, 'failed', error.message);
       } else {
+        // Max retries bereikt - stuur naar DLQ
         logger.error('Consumer: Max retries reached, sending to DLQ', {
           messageId,
           retryCount,
@@ -147,24 +165,70 @@ export class RabbitMQConsumer {
   private async handleMessage(message: RabbitMQMessage): Promise<void> {
     const { event, payload } = message;
 
-    switch (event) {
-      case 'CREATE_ORDER':
-      case 'UPDATE_ORDER':
-        if (payload.order) {
-          await this.salesforceService.createOrUpdateOrder(payload.order);
+    // Converteer naar OrderMessage formaat voor Salesforce
+    if (event === 'CREATE_ORDER' || event === 'UPDATE_ORDER') {
+      if (payload.order) {
+        const orderMessage: OrderMessage = {
+          id: payload.order.id,
+          customerId: payload.order.customerId,
+          amount: payload.order.amount,
+          currency: payload.order.currency,
+          items: payload.order.items,
+          // Optionele velden voor Lead mapping
+          brand: payload.customer?.name, // Gebruik customer name als brand
+          name: payload.customer?.name,
+        };
+
+        const resultaat = await this.salesforceClient.stuurBestellingAsync(orderMessage);
+
+        if (!resultaat.isSuccesvol) {
+          // Gooi error met informatie over of retry nodig is
+          const error = new Error(resultaat.foutmelding || 'Salesforce operatie mislukt');
+          (error as any).isHerhaalbaar = resultaat.isHerhaalbaar;
+          (error as any).statusCode = resultaat.statusCode;
+          throw error;
         }
-        break;
-      case 'CREATE_CUSTOMER':
-      case 'UPDATE_CUSTOMER':
-        if (payload.customer) {
-          await this.salesforceService.createOrUpdateCustomer(
-            payload.customer
-          );
-        }
-        break;
-      default:
-        throw new Error(`Unknown event type: ${event}`);
+
+        logger.info('Salesforce: Bestelling succesvol verwerkt', {
+          orderId: payload.order.id,
+          leadId: resultaat.leadId,
+        });
+        return;
+      }
     }
+
+    // Voor customer events, maak ook een Lead aan
+    if (event === 'CREATE_CUSTOMER' || event === 'UPDATE_CUSTOMER') {
+      if (payload.customer) {
+        // Voor customers maken we een Lead met customer informatie
+        const orderMessage: OrderMessage = {
+          id: payload.customer.id,
+          customerId: payload.customer.id,
+          amount: 0,
+          currency: 'EUR',
+          items: [],
+          brand: payload.customer.name,
+          name: payload.customer.name,
+        };
+
+        const resultaat = await this.salesforceClient.stuurBestellingAsync(orderMessage);
+
+        if (!resultaat.isSuccesvol) {
+          const error = new Error(resultaat.foutmelding || 'Salesforce operatie mislukt');
+          (error as any).isHerhaalbaar = resultaat.isHerhaalbaar;
+          (error as any).statusCode = resultaat.statusCode;
+          throw error;
+        }
+
+        logger.info('Salesforce: Customer succesvol verwerkt', {
+          customerId: payload.customer.id,
+          leadId: resultaat.leadId,
+        });
+        return;
+      }
+    }
+
+    throw new Error(`Onbekend event type: ${event}`);
   }
 
   private async sendToDLQ(

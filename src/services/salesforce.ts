@@ -36,11 +36,23 @@ export class SalesforceService {
   }
 
   async authenticate(): Promise<void> {
+    // Determine password to use - check if security token needs to be appended
     let passwordToUse = config.salesforce.password;
-    if (config.salesforce.securityToken && 
-        !config.salesforce.password.includes(config.salesforce.securityToken) &&
-        config.salesforce.securityToken.length > 0) {
-      passwordToUse = `${config.salesforce.password}${config.salesforce.securityToken}`;
+    const hasSecurityToken = config.salesforce.securityToken && config.salesforce.securityToken.length > 0;
+
+    if (hasSecurityToken) {
+      // Check if security token is already at the end of the password
+      const passwordEndsWithToken = config.salesforce.password.endsWith(config.salesforce.securityToken);
+
+      if (!passwordEndsWithToken) {
+        // Security token not found at the end, append it
+        passwordToUse = `${config.salesforce.password}${config.salesforce.securityToken}`;
+        logger.info('Salesforce: Appending security token to password');
+      } else {
+        logger.info('Salesforce: Security token already included in password');
+      }
+    } else {
+      logger.warn('Salesforce: No security token provided - authentication may fail if IP restrictions are enabled');
     }
 
     const loginUrls = [
@@ -50,14 +62,16 @@ export class SalesforceService {
 
     let lastError: any = null;
 
-    for (const loginUrl of loginUrls) {
+    for (let i = 0; i < loginUrls.length; i++) {
+      const loginUrl = loginUrls[i];
       try {
         logger.info('Salesforce: Authentication attempt', {
           loginUrl: loginUrl,
           username: config.salesforce.username,
           passwordLength: passwordToUse.length,
-          hasSecurityTokenInPassword: passwordToUse.includes(config.salesforce.securityToken || ''),
+          hasSecurityToken: hasSecurityToken,
           clientIdLength: config.salesforce.clientId.length,
+          clientSecretLength: config.salesforce.clientSecret.length,
         });
 
         const params = new URLSearchParams();
@@ -94,27 +108,51 @@ export class SalesforceService {
       } catch (error: any) {
         lastError = error;
         const errorMessage = error.response?.data?.error_description || error.response?.data?.error || error.message;
-        
-        if (error.response?.data?.error !== 'invalid_grant' && 
-            errorMessage !== 'authentication failure') {
+
+        // If it's not an authentication error, don't try other endpoints
+        if (error.response?.data?.error !== 'invalid_grant' &&
+          errorMessage !== 'authentication failure' &&
+          error.response?.status !== 400) {
+          logger.error('Salesforce: Non-authentication error, stopping retry', {
+            error: errorMessage,
+            status: error.response?.status,
+          });
           break;
         }
-        
-        if (loginUrl === loginUrls[loginUrls.length - 1]) {
-          logger.warn('Salesforce: Authentication failed with first endpoint, trying alternative...', {
+
+        // Log warning when trying alternative endpoint (not on last iteration)
+        if (i < loginUrls.length - 1) {
+          logger.warn('Salesforce: Authentication failed with endpoint, trying alternative...', {
             loginUrl: loginUrl,
             error: errorMessage,
+            nextUrl: loginUrls[i + 1],
           });
         }
       }
     }
 
-    const errorMessage = lastError?.response?.data?.error_description || 
-                        lastError?.response?.data?.error || 
-                        lastError?.message || 
-                        'Unknown error';
+    const errorMessage = lastError?.response?.data?.error_description ||
+      lastError?.response?.data?.error ||
+      lastError?.message ||
+      'Unknown error';
     const errorDetails = lastError?.response?.data || {};
-    
+
+    // Provide helpful troubleshooting information
+    const troubleshootingTips: string[] = [];
+    if (errorMessage.includes('invalid_grant') || errorMessage.includes('authentication failure')) {
+      troubleshootingTips.push(
+        '1. Verify your username is correct (exact value from Setup → Users)',
+        '2. Check if your password is correct',
+        '3. Verify your security token is correct (reset it if needed: Setup → My Personal Information → Reset My Security Token)',
+        '4. Ensure password + security token are combined correctly (no space between them)',
+        '5. Check if your Connected App Consumer Key and Secret are correct',
+        '6. Verify the Connected App has "Enable OAuth Settings" enabled',
+        '7. Check if IP restrictions are enabled on your Connected App (may need to whitelist your IP)',
+        '8. For sandbox orgs, use test.salesforce.com endpoint',
+        '9. Security tokens expire when password is reset - get a new one if you recently reset your password'
+      );
+    }
+
     logger.error('Salesforce: Authentication failed with all endpoints', {
       error: errorMessage,
       status: lastError?.response?.status,
@@ -125,9 +163,11 @@ export class SalesforceService {
       hasClientSecret: !!config.salesforce.clientSecret,
       hasUsername: !!config.salesforce.username,
       hasPassword: !!config.salesforce.password,
-      hasSecurityToken: !!config.salesforce.securityToken,
+      hasSecurityToken: hasSecurityToken,
+      passwordLength: passwordToUse.length,
+      troubleshootingTips: troubleshootingTips,
     });
-    throw new Error(`Salesforce authentication failed: ${errorMessage}`);
+    throw new Error(`Salesforce authentication failed: ${errorMessage}. See logs for troubleshooting tips.`);
   }
 
   private async ensureAuthenticated(): Promise<void> {
@@ -140,58 +180,18 @@ export class SalesforceService {
     await this.ensureAuthenticated();
 
     try {
-      const accountData = {
-        Name: customer.name,
-        ExternalId__c: customer.id,
-      };
+      const nameParts = customer.name.split(' ');
+      const firstName = nameParts[0] || customer.name;
+      const lastName = nameParts.slice(1).join(' ') || customer.name;
 
-      let accountId: string;
-      try {
-        const queryResponse = await this.axiosInstance.get(
-          `/services/data/v58.0/query/`,
-          {
-            params: {
-              q: `SELECT Id FROM Account WHERE ExternalId__c = '${customer.id}' LIMIT 1`,
-            },
-          }
-        );
-
-        if (queryResponse.data.records.length > 0) {
-          accountId = queryResponse.data.records[0].Id;
-          await this.axiosInstance.patch(
-            `/services/data/v58.0/sobjects/Account/${accountId}`,
-            accountData
-          );
-          logger.info('Salesforce: Account updated', {
-            accountId,
-            customerId: customer.id,
-          });
-        } else {
-          const createResponse = await this.axiosInstance.post(
-            '/services/data/v58.0/sobjects/Account/',
-            accountData
-          );
-          accountId = createResponse.data.id;
-          logger.info('Salesforce: Account created', {
-            accountId,
-            customerId: customer.id,
-          });
-        }
-      } catch (error: any) {
-        logger.error('Salesforce: Account operation failed', {
-          error: error.message,
-          customerId: customer.id,
-        });
-        throw error;
-      }
-
-      const contactData = {
-        FirstName: customer.name.split(' ')[0] || customer.name,
-        LastName: customer.name.split(' ').slice(1).join(' ') || customer.name,
+      const leadData = {
+        FirstName: firstName,
+        LastName: lastName,
         Email: customer.email,
         Phone: customer.phone || '',
-        AccountId: accountId,
+        Company: customer.name, // Use customer name as company
         ExternalId__c: customer.id,
+        LeadSource: 'RabbitMQ Integration',
       };
 
       try {
@@ -199,35 +199,36 @@ export class SalesforceService {
           `/services/data/v58.0/query/`,
           {
             params: {
-              q: `SELECT Id FROM Contact WHERE ExternalId__c = '${customer.id}' LIMIT 1`,
+              q: `SELECT Id FROM Lead WHERE ExternalId__c = '${customer.id}' LIMIT 1`,
             },
           }
         );
 
         if (queryResponse.data.records.length > 0) {
-          const contactId = queryResponse.data.records[0].Id;
+          const leadId = queryResponse.data.records[0].Id;
           await this.axiosInstance.patch(
-            `/services/data/v58.0/sobjects/Contact/${contactId}`,
-            contactData
+            `/services/data/v58.0/sobjects/Lead/${leadId}`,
+            leadData
           );
-          logger.info('Salesforce: Contact updated', {
-            contactId,
+          logger.info('Salesforce: Lead updated', {
+            leadId,
             customerId: customer.id,
           });
         } else {
           const createResponse = await this.axiosInstance.post(
-            '/services/data/v58.0/sobjects/Contact/',
-            contactData
+            '/services/data/v58.0/sobjects/Lead/',
+            leadData
           );
-          logger.info('Salesforce: Contact created', {
-            contactId: createResponse.data.id,
+          logger.info('Salesforce: Lead created', {
+            leadId: createResponse.data.id,
             customerId: customer.id,
           });
         }
       } catch (error: any) {
-        logger.error('Salesforce: Contact operation failed', {
+        logger.error('Salesforce: Lead operation failed', {
           error: error.message,
           customerId: customer.id,
+          errorDetails: error.response?.data,
         });
         throw error;
       }
@@ -244,39 +245,47 @@ export class SalesforceService {
     await this.ensureAuthenticated();
 
     try {
-      let accountId: string;
+      // First, find the customer Lead
+      let customerLead: any;
       try {
         const queryResponse = await this.axiosInstance.get(
           `/services/data/v58.0/query/`,
           {
             params: {
-              q: `SELECT AccountId FROM Contact WHERE ExternalId__c = '${order.customerId}' LIMIT 1`,
+              q: `SELECT Id, FirstName, LastName, Email, Phone, Company FROM Lead WHERE ExternalId__c = '${order.customerId}' LIMIT 1`,
             },
           }
         );
 
         if (queryResponse.data.records.length === 0) {
-          throw new Error(`Customer not found: ${order.customerId}`);
+          throw new Error(`Customer Lead not found: ${order.customerId}`);
         }
 
-        accountId = queryResponse.data.records[0].AccountId;
+        customerLead = queryResponse.data.records[0];
       } catch (error: any) {
-        logger.error('Salesforce: Failed to find customer account', {
+        logger.error('Salesforce: Failed to find customer Lead', {
           error: error.message,
           customerId: order.customerId,
         });
         throw error;
       }
 
-      const opportunityData = {
-        Name: `Order ${order.id}`,
-        AccountId: accountId,
-        Amount: order.amount,
-        StageName: 'Closed Won',
-        CloseDate: new Date().toISOString().split('T')[0],
-        CurrencyIsoCode: order.currency || 'EUR',
+      // Create or update Lead for the order
+      // We'll use the order ID as ExternalId and store order details in custom fields
+      const orderLeadData = {
+        FirstName: customerLead.FirstName || 'Order',
+        LastName: customerLead.LastName || `#${order.id}`,
+        Email: customerLead.Email || '',
+        Phone: customerLead.Phone || '',
+        Company: customerLead.Company || `Order ${order.id}`,
         ExternalId__c: order.id,
-        Description: `Order with ${order.items.length} items`,
+        LeadSource: 'RabbitMQ Integration - Order',
+        // Store order information in Description field (or use custom fields if available)
+        Description: `Order Details:\nAmount: ${order.amount} ${order.currency}\nItems: ${order.items.length}\nCustomer ID: ${order.customerId}\nItems: ${JSON.stringify(order.items)}`,
+        // Note: If you have custom fields for Order Amount, Currency, etc., add them here
+        // OrderAmount__c: order.amount,
+        // OrderCurrency__c: order.currency,
+        // OrderItems__c: JSON.stringify(order.items),
       };
 
       try {
@@ -284,35 +293,38 @@ export class SalesforceService {
           `/services/data/v58.0/query/`,
           {
             params: {
-              q: `SELECT Id FROM Opportunity WHERE ExternalId__c = '${order.id}' LIMIT 1`,
+              q: `SELECT Id FROM Lead WHERE ExternalId__c = '${order.id}' LIMIT 1`,
             },
           }
         );
 
         if (queryResponse.data.records.length > 0) {
-          const opportunityId = queryResponse.data.records[0].Id;
+          const leadId = queryResponse.data.records[0].Id;
           await this.axiosInstance.patch(
-            `/services/data/v58.0/sobjects/Opportunity/${opportunityId}`,
-            opportunityData
+            `/services/data/v58.0/sobjects/Lead/${leadId}`,
+            orderLeadData
           );
-          logger.info('Salesforce: Opportunity updated', {
-            opportunityId,
+          logger.info('Salesforce: Order Lead updated', {
+            leadId,
             orderId: order.id,
+            customerId: order.customerId,
           });
         } else {
           const createResponse = await this.axiosInstance.post(
-            '/services/data/v58.0/sobjects/Opportunity/',
-            opportunityData
+            '/services/data/v58.0/sobjects/Lead/',
+            orderLeadData
           );
-          logger.info('Salesforce: Opportunity created', {
-            opportunityId: createResponse.data.id,
+          logger.info('Salesforce: Order Lead created', {
+            leadId: createResponse.data.id,
             orderId: order.id,
+            customerId: order.customerId,
           });
         }
       } catch (error: any) {
-        logger.error('Salesforce: Opportunity operation failed', {
+        logger.error('Salesforce: Order Lead operation failed', {
           error: error.message,
           orderId: order.id,
+          errorDetails: error.response?.data,
         });
         throw error;
       }
