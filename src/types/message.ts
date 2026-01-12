@@ -11,6 +11,9 @@ export interface MessagePayload {
     name: string;
     email: string;
     phone?: string;
+    address?: string;
+    city?: string;
+    postalCode?: string;
   };
   order?: {
     id: string;
@@ -19,9 +22,19 @@ export interface MessagePayload {
     currency: string;
     items: Array<{
       productId: string;
-      quantity: number;
-      price: number;
+      productName?: string;
+      quantity: number; // Aantal keer 100g
+      price: number; // Prijs per 100g
+      totalPrice: number; // Totale prijs voor deze item
     }>;
+    customerInfo?: {
+      name: string;
+      email: string;
+      phone?: string;
+      address?: string;
+      city?: string;
+      postalCode?: string;
+    };
   };
 }
 

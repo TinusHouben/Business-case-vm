@@ -22,9 +22,19 @@ interface OrderPayload {
   currency: string;
   items: Array<{
     productId: string;
-    quantity: number;
-    price: number;
+    productName?: string;
+    quantity: number; // aantal keer 100g
+    price: number; // prijs per 100g
+    totalPrice?: number; // totale prijs voor deze item
   }>;
+  customerInfo?: {
+    name: string;
+    email: string;
+    phone?: string;
+    address?: string;
+    city?: string;
+    postalCode?: string;
+  };
 }
 
 export class SalesforceService {
@@ -270,6 +280,16 @@ export class SalesforceService {
         throw error;
       }
 
+      // Maak een beschrijving met snoepjes details
+      const itemsDescription = order.items.map(item => {
+        const candyName = item.productName || item.productId;
+        const weight = item.quantity * 100; // quantity is in 100g units
+        return `${candyName}: ${weight}g (€${item.totalPrice?.toFixed(2) || (item.price * item.quantity).toFixed(2)})`;
+      }).join('\n');
+
+      const totalWeight = order.items.reduce((sum, item) => sum + (item.quantity * 100), 0);
+      const description = `Snoepjes Bestelling\n\n${itemsDescription}\n\nTotaal: ${totalWeight}g - €${order.amount.toFixed(2)}`;
+
       // Create or update Lead for the order
       // We'll use the order ID as ExternalId and store order details in custom fields
       const orderLeadData = {
@@ -280,12 +300,8 @@ export class SalesforceService {
         Company: customerLead.Company || `Order ${order.id}`,
         ExternalId__c: order.id,
         LeadSource: 'RabbitMQ Integration - Order',
-        // Store order information in Description field (or use custom fields if available)
-        Description: `Order Details:\nAmount: ${order.amount} ${order.currency}\nItems: ${order.items.length}\nCustomer ID: ${order.customerId}\nItems: ${JSON.stringify(order.items)}`,
-        // Note: If you have custom fields for Order Amount, Currency, etc., add them here
-        // OrderAmount__c: order.amount,
-        // OrderCurrency__c: order.currency,
-        // OrderItems__c: JSON.stringify(order.items),
+        // Store order information in Description field
+        Description: description,
       };
 
       try {
