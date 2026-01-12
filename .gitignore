@@ -11,5 +11,10 @@ logs/
 *.pid.lock
 coverage/
 .nyc_output/
+.cursor/
+.vscode/
+*.swp
+*.swo
+*~
 
 
