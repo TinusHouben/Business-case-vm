@@ -49,9 +49,9 @@ function App() {
   };
 
   const addToBasket = (candy: Candy) => {
-    const existingItem = basket.find(item => item.candyId === candy.id);
+    const existingItem = basket.find((item: BasketItem) => item.candyId === candy.id);
     if (existingItem) {
-      setBasket(basket.map(item =>
+      setBasket(basket.map((item: BasketItem) =>
         item.candyId === candy.id
           ? { ...item, quantity: item.quantity + 1 }
           : item
@@ -67,23 +67,23 @@ function App() {
       removeFromBasket(candyId);
       return;
     }
-    setBasket(basket.map(item =>
+    setBasket(basket.map((item: BasketItem) =>
       item.candyId === candyId ? { ...item, quantity } : item
     ));
   };
 
   const removeFromBasket = (candyId: string) => {
-    setBasket(basket.filter(item => item.candyId !== candyId));
+    setBasket(basket.filter((item: BasketItem) => item.candyId !== candyId));
   };
 
   const getTotalPrice = () => {
-    return basket.reduce((total, item) => {
+    return basket.reduce((total: number, item: BasketItem) => {
       return total + (item.candy.pricePer100g * item.quantity);
     }, 0);
   };
 
   const getTotalWeight = () => {
-    return basket.reduce((total, item) => total + item.quantity, 0) * 100;
+    return basket.reduce((total: number, item: BasketItem) => total + item.quantity, 0) * 100;
   };
 
   const handleCheckout = async (e: React.FormEvent) => {
