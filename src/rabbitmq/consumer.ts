@@ -6,13 +6,6 @@ import logger from "../utils/logger";
 import { isMessageProcessed, markMessageProcessed } from "../utils/idempotency";
 import { SalesforceRefreshService } from "../services/salesforce-refresh";
 
-/**
- * Deze consumer schrijft naar jouw custom objects:
- * - CustomerCustom__c (upsert via ExternalId__c)
- * - OrderCustom__c (create + lookup CustomerC__c)
- *
- * Auth: refresh-token flow (SalesforceRefreshService)
- */
 export class RabbitMQConsumer {
   private connection: amqp.Connection | null = null;
   private channel: amqp.Channel | null = null;
@@ -123,7 +116,6 @@ export class RabbitMQConsumer {
           messageId: message.messageId,
         });
 
-        // ACK origineel; we hebben een nieuwe copy ge-enqueued
         this.channel.ack(msg);
       } else if (!isHerhaalbaar) {
         logger.error("Consumer: Permanente fout - geen retry", {
@@ -150,7 +142,6 @@ export class RabbitMQConsumer {
   private async handleMessage(message: RabbitMQMessage): Promise<void> {
     const { event, payload } = message;
 
-    // We verwachten voor order events: payload.order + payload.customer
     if (event === EventType.CREATE_ORDER || event === EventType.UPDATE_ORDER) {
       if (!payload.order) throw this.permanentError("payload.order ontbreekt");
       if (!payload.customer) throw this.permanentError("payload.customer ontbreekt (nodig voor upsert)");
@@ -158,7 +149,7 @@ export class RabbitMQConsumer {
       const customerExternalId = payload.customer.id;
       const orderExternalId = payload.order.id;
 
-      // 1) Upsert customer + haal SF Id op (incl. address/city/postalCode)
+      // 1) Upsert customer + haal SF Id op
       const customerSfId = await this.upsertCustomerAndGetId({
         externalId: customerExternalId,
         name: payload.customer.name,
@@ -169,13 +160,25 @@ export class RabbitMQConsumer {
         postalCode: payload.customer.postalCode,
       });
 
-      // 2) Create order + link CustomerC__c (lookup field op OrderCustom__c)
-      const orderSfId = await this.createOrder({
+      // 2) Upsert order (idempotent) + krijg id + createdNew
+      const { id: orderSfId, createdNew } = await this.upsertOrder({
         externalOrderId: orderExternalId,
         total: payload.order.amount,
         status: "NEW",
         customerSfId,
       });
+
+      // 3) Stock verminderen enkel bij "nieuw aangemaakte" order (anders dubbele decrement vermijden)
+      if (createdNew) {
+        const items = payload.order.items ?? [];
+        await this.decrementStockForOrderItems(items, orderExternalId);
+      } else {
+        logger.info("Salesforce: Order bestond al (skip stock decrement)", {
+          messageId: message.messageId,
+          orderExternalId,
+          orderSfId,
+        });
+      }
 
       logger.info("Salesforce: Order synced", {
         messageId: message.messageId,
@@ -183,12 +186,12 @@ export class RabbitMQConsumer {
         customerSfId,
         orderExternalId,
         orderSfId,
+        stockDecremented: createdNew,
       });
 
       return;
     }
 
-    // Customer-only events (optioneel): enkel customer upsert (incl. address/city/postalCode)
     if (event === EventType.CREATE_CUSTOMER || event === EventType.UPDATE_CUSTOMER) {
       if (!payload.customer) throw this.permanentError("payload.customer ontbreekt");
 
@@ -214,7 +217,7 @@ export class RabbitMQConsumer {
     throw this.permanentError(`Onbekend event type: ${event}`);
   }
 
-  // ---------- Salesforce helpers (custom objects) ----------
+  // ---------- Salesforce helpers ----------
 
   private sfInstance(): string {
     const instance = process.env.SALESFORCE_INSTANCE_URL;
@@ -224,7 +227,11 @@ export class RabbitMQConsumer {
 
   private sfApiVersion(): string {
     const raw = process.env.SALESFORCE_API_VERSION ?? "60.0";
-    return raw.replace(/^v/i, ""); // "v60.0" -> "60.0"
+    return raw.replace(/^v/i, "");
+  }
+
+  private escapeSoql(value: string): string {
+    return String(value).replace(/\\/g, "\\\\").replace(/'/g, "\\'");
   }
 
   private async upsertCustomerAndGetId(input: {
@@ -245,12 +252,7 @@ export class RabbitMQConsumer {
       input.externalId
     )}`;
 
-    // DEBUG: toon exacte URL die we patchen (mag je later verwijderen)
-    logger.info("SF DEBUG upsertUrl", { instance, v, upsertUrl });
-
     try {
-      // IMPORTANT: ExternalId__c NIET in body (want zit al in URL)
-      // ⚠️ PAS deze field API names aan als jouw velden anders heten in Salesforce
       await this.sf.client.patch(upsertUrl, {
         Name: input.name,
         Email__c: input.email,
@@ -261,7 +263,9 @@ export class RabbitMQConsumer {
       });
 
       const queryUrl = `${instance}/services/data/v${v}/query`;
-      const q = `SELECT Id FROM CustomerCustom__c WHERE ExternalId__c = '${input.externalId}' LIMIT 1`;
+      const q = `SELECT Id FROM CustomerCustom__c WHERE ExternalId__c = '${this.escapeSoql(
+        input.externalId
+      )}' LIMIT 1`;
 
       const qr = await this.sf.client.get(queryUrl, { params: { q } });
 
@@ -275,63 +279,164 @@ export class RabbitMQConsumer {
       const data = e?.response?.data ?? e?.message;
 
       if (status && status >= 400 && status < 500) {
-        throw this.permanentError(
-          `Salesforce 4xx bij customer upsert: ${JSON.stringify(data)}`,
-          status
-        );
+        throw this.permanentError(`Salesforce 4xx bij customer upsert: ${JSON.stringify(data)}`, status);
       }
 
-      throw this.retryableError(
-        `Salesforce error bij customer upsert: ${JSON.stringify(data)}`,
-        status ?? 500
-      );
+      throw this.retryableError(`Salesforce error bij customer upsert: ${JSON.stringify(data)}`, status ?? 500);
     }
   }
 
-  private async createOrder(input: {
+  private async upsertOrder(input: {
     externalOrderId: string;
     total: number;
     status: "NEW" | "PAID" | "CANCELLED";
     customerSfId: string;
-  }): Promise<string> {
+  }): Promise<{ id: string; createdNew: boolean }> {
     await this.sf.authenticate();
 
     const instance = this.sfInstance();
     const v = this.sfApiVersion();
 
-    const createUrl = `${instance}/services/data/v${v}/sobjects/OrderCustom__c/`;
+    const upsertUrl = `${instance}/services/data/v${v}/sobjects/OrderCustom__c/ExternalOrderId__c/${encodeURIComponent(
+      input.externalOrderId
+    )}`;
 
     try {
-      const res = await this.sf.client.post(createUrl, {
-        ExternalOrderId__c: input.externalOrderId,
+      const res = await this.sf.client.patch(upsertUrl, {
         Total__c: input.total,
         Status__c: input.status,
         CustomerC__c: input.customerSfId,
+        // ExternalOrderId__c niet nodig in body (zit in URL)
       });
 
-      if (!res.data?.success) {
-        throw new Error(`Order create failed: ${JSON.stringify(res.data)}`);
+      const createdNew = res.status === 201;
+
+      const queryUrl = `${instance}/services/data/v${v}/query`;
+      const q = `SELECT Id FROM OrderCustom__c WHERE ExternalOrderId__c = '${this.escapeSoql(
+        input.externalOrderId
+      )}' LIMIT 1`;
+
+      const qr = await this.sf.client.get(queryUrl, { params: { q } });
+
+      if (!qr.data.records?.length) {
+        throw this.retryableError("Order not found after upsert", 500);
       }
 
-      return res.data.id as string;
+      return { id: qr.data.records[0].Id as string, createdNew };
     } catch (e: any) {
       const status = e?.response?.status;
 
       if (status && status >= 400 && status < 500) {
-        throw this.permanentError(
-          `Salesforce 4xx bij order create: ${JSON.stringify(e?.response?.data ?? e?.message)}`,
-          status
-        );
+        throw this.permanentError(`Salesforce 4xx bij order upsert: ${JSON.stringify(e?.response?.data ?? e?.message)}`, status);
       }
 
-      throw this.retryableError(
-        `Salesforce error bij order create: ${JSON.stringify(e?.response?.data ?? e?.message)}`,
-        status ?? 500
-      );
+      throw this.retryableError(`Salesforce error bij order upsert: ${JSON.stringify(e?.response?.data ?? e?.message)}`, status ?? 500);
     }
   }
 
-  // ---------- Error helpers (retry vs permanent) ----------
+  private async findProductByExternalProductId(externalProductId: string): Promise<{ id: string; stock: number; name?: string }> {
+    await this.sf.authenticate();
+
+    const instance = this.sfInstance();
+    const v = this.sfApiVersion();
+
+    const queryUrl = `${instance}/services/data/v${v}/query`;
+    const q = `
+      SELECT Id, Name, Stock__c
+      FROM ProductCustom__c
+      WHERE ExternalProductId__c = '${this.escapeSoql(externalProductId)}'
+      LIMIT 1
+    `;
+
+    try {
+      const qr = await this.sf.client.get(queryUrl, { params: { q } });
+      const rec = qr.data.records?.[0];
+
+      if (!rec) {
+        throw this.permanentError(`Product niet gevonden in Salesforce: ${externalProductId}`, 404);
+      }
+
+      return {
+        id: rec.Id as string,
+        stock: Number(rec.Stock__c ?? 0),
+        name: rec.Name as string | undefined,
+      };
+    } catch (e: any) {
+      const status = e?.response?.status;
+      const data = e?.response?.data ?? e?.message;
+
+      if (status && status >= 400 && status < 500) {
+        throw this.permanentError(`Salesforce 4xx bij product query: ${JSON.stringify(data)}`, status);
+      }
+
+      throw this.retryableError(`Salesforce error bij product query: ${JSON.stringify(data)}`, status ?? 500);
+    }
+  }
+
+  private async setProductStockById(productSfId: string, newStock: number): Promise<void> {
+    await this.sf.authenticate();
+
+    const instance = this.sfInstance();
+    const v = this.sfApiVersion();
+
+    const url = `${instance}/services/data/v${v}/sobjects/ProductCustom__c/${encodeURIComponent(productSfId)}`;
+
+    try {
+      await this.sf.client.patch(url, {
+        Stock__c: newStock,
+      });
+    } catch (e: any) {
+      const status = e?.response?.status;
+
+      if (status && status >= 400 && status < 500) {
+        throw this.permanentError(`Salesforce 4xx bij product stock update: ${JSON.stringify(e?.response?.data ?? e?.message)}`, status);
+      }
+
+      throw this.retryableError(`Salesforce error bij product stock update: ${JSON.stringify(e?.response?.data ?? e?.message)}`, status ?? 500);
+    }
+  }
+
+  private async decrementStockForOrderItems(
+    items: Array<{ productId: string; quantity: number; price: number; totalPrice: number; productName?: string }>,
+    orderExternalId: string
+  ): Promise<void> {
+    if (!Array.isArray(items) || items.length === 0) return;
+
+    for (const item of items) {
+      const externalProductId = String(item.productId);
+      const qty = Number(item.quantity ?? 0);
+
+      if (!externalProductId || !qty || qty <= 0) {
+        throw this.permanentError(`Ongeldig order item (productId/quantity): ${JSON.stringify(item)}`, 400);
+      }
+
+      const product = await this.findProductByExternalProductId(externalProductId);
+
+      const currentStock = Number(product.stock ?? 0);
+      const newStock = currentStock - qty;
+
+      if (newStock < 0) {
+        throw this.permanentError(
+          `Niet genoeg stock voor ${externalProductId} (order ${orderExternalId}): gevraagd=${qty}, beschikbaar=${currentStock}`,
+          409
+        );
+      }
+
+      await this.setProductStockById(product.id, newStock);
+
+      logger.info("Salesforce: Stock updated", {
+        orderExternalId,
+        externalProductId,
+        productSfId: product.id,
+        productName: product.name,
+        oldStock: currentStock,
+        newStock,
+        qty,
+      });
+    }
+  }
+
+  // ---------- Error helpers ----------
 
   private retryableError(message: string, statusCode = 500): Error {
     const err: any = new Error(message);
