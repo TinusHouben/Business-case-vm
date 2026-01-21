@@ -33,15 +33,6 @@ export type MessageResponse = {
   data: any;
 };
 
-export type Candy = {
-  id: string;
-  name: string;
-  description: string;
-  pricePer100g: number;
-  category: string;
-  image?: string;
-};
-
 export type CandyOrderRequest = {
   basket: Array<{
     candyId: string;
@@ -58,11 +49,20 @@ export type CandyOrderRequest = {
   };
 };
 
+export type Product = {
+  id: string;
+  externalProductId: string;
+  name: string;
+  price: number;
+  stock: number;
+  category: string;
+};
+
 class ApiClient {
-  async getCandies(): Promise<{ success: boolean; candies: Candy[]; total: number }> {
-    const response = await fetch(`${API_BASE_URL}/api/candies`);
+  async getProducts(): Promise<{ success: boolean; products: Product[]; total: number }> {
+    const response = await fetch(`${API_BASE_URL}/api/products`);
     if (!response.ok) {
-      throw new Error('Failed to fetch candies');
+      throw new Error('Failed to fetch products');
     }
     return response.json();
   }
@@ -76,8 +76,8 @@ class ApiClient {
       body: JSON.stringify(order),
     });
     if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error || 'Failed to create candy order');
+      const error = await response.json().catch(() => ({}));
+      throw new Error((error as any).error || 'Failed to create candy order');
     }
     return response.json();
   }

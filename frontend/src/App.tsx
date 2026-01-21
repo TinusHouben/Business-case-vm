@@ -1,11 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { apiClient } from './api/client';
-import type { Candy } from './api/client';
+import type { Product } from './api/client';
 import './App.css';
 
 type BasketItem = {
-  candyId: string;
-  candy: Candy;
+  productKey: string; // externalProductId
+  product: Product;
   quantity: number; // aantal keer 100g
 };
 
@@ -17,9 +17,15 @@ function loadBasketFromSession(): BasketItem[] {
     if (!raw) return [];
     const parsed = JSON.parse(raw) as BasketItem[];
 
-    // Basic shape check
     if (!Array.isArray(parsed)) return [];
-    return parsed.filter((x: any) => x && typeof x.candyId === 'string' && typeof x.quantity === 'number' && x.candy);
+    return parsed.filter(
+      (x: any) =>
+        x &&
+        typeof x.productKey === 'string' &&
+        typeof x.quantity === 'number' &&
+        x.product &&
+        typeof x.product.externalProductId === 'string'
+    );
   } catch {
     return [];
   }
@@ -35,9 +41,10 @@ function saveBasketToSession(basket: BasketItem[]) {
 
 function App() {
   const [loading, setLoading] = useState(false);
-  const [loadingCandies, setLoadingCandies] = useState(true);
+  const [loadingProducts, setLoadingProducts] = useState(true);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
-  const [candies, setCandies] = useState<Candy[]>([]);
+
+  const [products, setProducts] = useState<Product[]>([]);
   const [basket, setBasket] = useState<BasketItem[]>(() => loadBasketFromSession());
   const [showCheckout, setShowCheckout] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
@@ -51,39 +58,36 @@ function App() {
     postalCode: '',
   });
 
-  // Load candies once
   useEffect(() => {
-    loadCandies();
+    loadProducts();
   }, []);
 
-  // Persist basket on every change
   useEffect(() => {
     saveBasketToSession(basket);
   }, [basket]);
 
-  // When candies are loaded, rehydrate basket candy objects (in case the list changed)
   useEffect(() => {
-    if (candies.length === 0) return;
+    if (products.length === 0) return;
 
     setBasket((prev) =>
       prev
         .map((item) => {
-          const freshCandy = candies.find((c) => c.id === item.candyId);
-          return freshCandy ? { ...item, candy: freshCandy } : null;
+          const fresh = products.find((p) => p.externalProductId === item.productKey);
+          return fresh ? { ...item, product: fresh } : null;
         })
         .filter(Boolean) as BasketItem[]
     );
-  }, [candies]);
+  }, [products]);
 
-  const loadCandies = async () => {
+  const loadProducts = async () => {
     try {
-      setLoadingCandies(true);
-      const response = await apiClient.getCandies();
-      setCandies(response.candies);
+      setLoadingProducts(true);
+      const response = await apiClient.getProducts();
+      setProducts(response.products);
     } catch (error: any) {
-      showMessage('error', error.message || 'Failed to load candies');
+      showMessage('error', error.message || 'Failed to load products');
     } finally {
-      setLoadingCandies(false);
+      setLoadingProducts(false);
     }
   };
 
@@ -92,30 +96,50 @@ function App() {
     setTimeout(() => setMessage(null), 5000);
   };
 
-  const addToBasket = (candy: Candy) => {
-    const existingItem = basket.find((item: BasketItem) => item.candyId === candy.id);
-    if (existingItem) {
+  const addToBasket = (product: Product) => {
+    if (product.stock <= 0) {
+      showMessage('error', `${product.name} is uitverkocht`);
+      return;
+    }
+
+    const existing = basket.find((item) => item.productKey === product.externalProductId);
+    const currentQty = existing?.quantity ?? 0;
+
+    if (currentQty + 1 > product.stock) {
+      showMessage('error', `Niet genoeg stock voor ${product.name} (beschikbaar: ${product.stock})`);
+      return;
+    }
+
+    if (existing) {
       setBasket(
-        basket.map((item: BasketItem) =>
-          item.candyId === candy.id ? { ...item, quantity: item.quantity + 1 } : item
+        basket.map((item) =>
+          item.productKey === product.externalProductId ? { ...item, quantity: item.quantity + 1 } : item
         )
       );
     } else {
-      setBasket([...basket, { candyId: candy.id, candy, quantity: 1 }]);
+      setBasket([...basket, { productKey: product.externalProductId, product, quantity: 1 }]);
     }
-    showMessage('success', `${candy.name} toegevoegd aan mandje!`);
+
+    showMessage('success', `${product.name} toegevoegd aan mandje!`);
   };
 
-  const updateBasketQuantity = (candyId: string, quantity: number) => {
+  const updateBasketQuantity = (productKey: string, quantity: number) => {
     if (quantity <= 0) {
-      removeFromBasket(candyId);
+      removeFromBasket(productKey);
       return;
     }
-    setBasket(basket.map((item: BasketItem) => (item.candyId === candyId ? { ...item, quantity } : item)));
+
+    const prod = products.find((p) => p.externalProductId === productKey);
+    if (prod && quantity > prod.stock) {
+      showMessage('error', `Niet genoeg stock (beschikbaar: ${prod.stock})`);
+      return;
+    }
+
+    setBasket(basket.map((item) => (item.productKey === productKey ? { ...item, quantity } : item)));
   };
 
-  const removeFromBasket = (candyId: string) => {
-    setBasket(basket.filter((item: BasketItem) => item.candyId !== candyId));
+  const removeFromBasket = (productKey: string) => {
+    setBasket(basket.filter((item) => item.productKey !== productKey));
   };
 
   const clearBasket = () => {
@@ -128,13 +152,11 @@ function App() {
   };
 
   const getTotalPrice = () => {
-    return basket.reduce((total: number, item: BasketItem) => {
-      return total + item.candy.pricePer100g * item.quantity;
-    }, 0);
+    return basket.reduce((total, item) => total + item.product.price * item.quantity, 0);
   };
 
   const getTotalWeight = () => {
-    return basket.reduce((total: number, item: BasketItem) => total + item.quantity, 0) * 100;
+    return basket.reduce((total, item) => total + item.quantity, 0) * 100;
   };
 
   const handleCheckout = async (e: React.FormEvent) => {
@@ -154,7 +176,7 @@ function App() {
     try {
       const orderRequest = {
         basket: basket.map((item) => ({
-          candyId: item.candyId,
+          candyId: item.productKey,
           quantity: item.quantity,
         })),
         customerInfo,
@@ -163,7 +185,6 @@ function App() {
       const response = await apiClient.createCandyOrder(orderRequest);
       showMessage('success', `Bestelling geplaatst! Order ID: ${response.data.orderId}`);
 
-      // Reset basket and form
       clearBasket();
       setShowCheckout(false);
       setCustomerInfo({
@@ -174,6 +195,8 @@ function App() {
         city: '',
         postalCode: '',
       });
+
+      await loadProducts();
     } catch (error: any) {
       showMessage('error', error.message || 'Failed to place order');
     } finally {
@@ -181,16 +204,29 @@ function App() {
     }
   };
 
-  const categories = ['all', ...Array.from(new Set(candies.map((c) => c.category)))];
-  const filteredCandies =
-    selectedCategory === 'all' ? candies : candies.filter((c) => c.category === selectedCategory);
+  const categories = useMemo(() => {
+    const unique = Array.from(new Set(products.map((p) => (p.category || 'Overig').trim() || 'Overig')));
+    unique.sort((a, b) => a.localeCompare(b));
+    return ['all', ...unique];
+  }, [products]);
+
+  const filteredProducts = useMemo(() => {
+    if (selectedCategory === 'all') return products;
+    return products.filter((p) => (p.category || 'Overig') === selectedCategory);
+  }, [products, selectedCategory]);
+
+  const stockMap = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const p of products) m.set(p.externalProductId, p.stock);
+    return m;
+  }, [products]);
 
   return (
     <div className="app">
       <header className="header">
         <h1>🍬 Snoepjes Winkel 🍬</h1>
         <p style={{ marginTop: '0.5rem', color: '#999', fontSize: '0.9rem' }}>
-          Bestel je favoriete snoepjes per 100 gram
+          Producten komen live uit Salesforce — bestellen per 100 gram
         </p>
       </header>
 
@@ -210,32 +246,49 @@ function App() {
           {basket.length === 0 ? (
             <div className="basket-empty">
               <p>Je mandje is leeg</p>
-              <p className="basket-empty-hint">Voeg snoepjes toe om te beginnen!</p>
+              <p className="basket-empty-hint">Voeg producten toe om te beginnen!</p>
             </div>
           ) : (
             <>
               <div className="basket-items">
-                {basket.map((item) => (
-                  <div key={item.candyId} className="basket-item">
-                    <div className="basket-item-info">
-                      <strong>{item.candy.name}</strong>
-                      <span className="basket-item-price">€{item.candy.pricePer100g.toFixed(2)} per 100g</span>
+                {basket.map((item) => {
+                  const liveStock = stockMap.get(item.productKey);
+                  return (
+                    <div key={item.productKey} className="basket-item">
+                      <div className="basket-item-info">
+                        <strong>{item.product.name}</strong>
+                        <span className="basket-item-price">€{item.product.price.toFixed(2)} per 100g</span>
+                        <span className="basket-item-price" style={{ opacity: 0.8 }}>
+                          Categorie: {item.product.category || 'Overig'}
+                        </span>
+                        {typeof liveStock === 'number' && (
+                          <span className="basket-item-price" style={{ opacity: 0.8 }}>
+                            Stock: {liveStock}
+                          </span>
+                        )}
+                      </div>
+                      <div className="basket-item-controls">
+                        <button
+                          className="quantity-btn"
+                          onClick={() => updateBasketQuantity(item.productKey, item.quantity - 1)}
+                        >
+                          -
+                        </button>
+                        <span className="quantity-display">{item.quantity}x 100g</span>
+                        <button
+                          className="quantity-btn"
+                          onClick={() => updateBasketQuantity(item.productKey, item.quantity + 1)}
+                        >
+                          +
+                        </button>
+                        <button className="remove-btn" onClick={() => removeFromBasket(item.productKey)}>
+                          ✕
+                        </button>
+                      </div>
+                      <div className="basket-item-total">€{(item.product.price * item.quantity).toFixed(2)}</div>
                     </div>
-                    <div className="basket-item-controls">
-                      <button className="quantity-btn" onClick={() => updateBasketQuantity(item.candyId, item.quantity - 1)}>
-                        -
-                      </button>
-                      <span className="quantity-display">{item.quantity}x 100g</span>
-                      <button className="quantity-btn" onClick={() => updateBasketQuantity(item.candyId, item.quantity + 1)}>
-                        +
-                      </button>
-                      <button className="remove-btn" onClick={() => removeFromBasket(item.candyId)}>
-                        ✕
-                      </button>
-                    </div>
-                    <div className="basket-item-total">€{(item.candy.pricePer100g * item.quantity).toFixed(2)}</div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
 
               <div className="basket-summary">
@@ -263,65 +316,39 @@ function App() {
                 className={`category-btn ${selectedCategory === category ? 'active' : ''}`}
                 onClick={() => setSelectedCategory(category)}
               >
-                {category === 'all' ? 'Alle Snoepjes' : category}
+                {category === 'all' ? 'Alle Producten' : category}
               </button>
             ))}
           </div>
 
-          {loadingCandies ? (
-            <div className="loading">Snoepjes laden...</div>
+          {loadingProducts ? (
+            <div className="loading">Producten laden...</div>
           ) : (
             <div className="candies-grid">
-              {filteredCandies.map((candy) => {
-                // Emoji fallback voor verschillende snoepjes categorieën
-                const getCandyEmoji = (category: string) => {
-                  const emojiMap: { [key: string]: string } = {
-                    Zuur: '🍋',
-                    Zacht: '🍬',
-                    Drop: '🖤',
-                    Chocolade: '🍫',
-                    Fruit: '🍇',
-                    Munt: '🌿',
-                    Hard: '🍭',
-                    Speciaal: '⭐',
-                  };
-                  return emojiMap[category] || '🍬';
-                };
-
-                const candyEmoji = getCandyEmoji(candy.category);
-
+              {filteredProducts.map((p) => {
+                const outOfStock = p.stock <= 0;
                 return (
-                  <div key={candy.id} className="candy-card">
-                    <div className="candy-image-container">
-                      {candy.image ? (
-                        <img
-                          src={candy.image}
-                          alt={candy.name}
-                          className="candy-image"
-                          onError={(e) => {
-                            // Fallback naar emoji als image niet laadt
-                            const target = e.target as HTMLImageElement;
-                            target.style.display = 'none';
-                            const emojiDiv = target.nextElementSibling as HTMLElement;
-                            if (emojiDiv) emojiDiv.style.display = 'flex';
-                          }}
-                        />
-                      ) : null}
-                      <div className="candy-emoji" style={{ display: candy.image ? 'none' : 'flex' }}>
-                        <span className="candy-emoji-large">{candyEmoji}</span>
-                      </div>
-                    </div>
+                  <div key={p.externalProductId} className="candy-card">
                     <div className="candy-header">
-                      <h3>{candy.name}</h3>
-                      <span className={`candy-category category-${candy.category.toLowerCase().replace(/\s+/g, '-')}`}>
-                        {candy.category}
-                      </span>
+                      <h3>{p.name}</h3>
+                      <span className="candy-category">{p.category || 'Overig'}</span>
                     </div>
-                    <p className="candy-description">{candy.description}</p>
+
+                    <p className="candy-description" style={{ marginBottom: '0.8rem' }}>
+                      External ID: <strong>{p.externalProductId}</strong>
+                      <br />
+                      Stock: <strong>{p.stock}</strong>
+                    </p>
+
                     <div className="candy-footer">
-                      <div className="candy-price">€{candy.pricePer100g.toFixed(2)} / 100g</div>
-                      <button className="add-to-basket-btn" onClick={() => addToBasket(candy)}>
-                        🛒 Toevoegen
+                      <div className="candy-price">€{p.price.toFixed(2)} / 100g</div>
+                      <button
+                        className="add-to-basket-btn"
+                        onClick={() => addToBasket(p)}
+                        disabled={outOfStock}
+                        title={outOfStock ? 'Uitverkocht' : 'Toevoegen'}
+                      >
+                        {outOfStock ? 'Uitverkocht' : '🛒 Toevoegen'}
                       </button>
                     </div>
                   </div>
