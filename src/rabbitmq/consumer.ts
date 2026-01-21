@@ -1,14 +1,22 @@
 // src/rabbitmq/consumer.ts
-import * as amqp from "amqplib";
+import amqp, { Channel, ChannelModel, ConsumeMessage } from "amqplib";	
 import { RabbitMQMessage, EventType } from "../types/message";
 import { config } from "../config";
 import logger from "../utils/logger";
 import { isMessageProcessed, markMessageProcessed } from "../utils/idempotency";
 import { SalesforceRefreshService } from "../services/salesforce-refresh";
 
+type OrderItem = {
+  productId: string;
+  quantity: number;
+  price: number;
+  totalPrice: number;
+  productName?: string;
+};
+
 export class RabbitMQConsumer {
-  private connection: amqp.Connection | null = null;
-  private channel: amqp.Channel | null = null;
+private connection: ChannelModel | null = null;
+  private channel: Channel | null = null;
 
   private sf = new SalesforceRefreshService();
 
@@ -16,17 +24,16 @@ export class RabbitMQConsumer {
     try {
       logger.info("Consumer: Connecting to RabbitMQ", { url: config.rabbitmq.url });
 
-      this.connection = (await amqp.connect(config.rabbitmq.url) as unknown) as amqp.Connection;
-      if (!this.connection) throw new Error("Failed to establish RabbitMQ connection");
+      const conn = await amqp.connect(config.rabbitmq.url);
+      this.connection = conn;
 
-      // @ts-ignore
-      this.channel = await this.connection.createChannel();
-      if (!this.channel) throw new Error("Failed to create RabbitMQ channel");
+      const ch = await conn.createChannel();
+      this.channel = ch;
 
-      await this.channel.assertQueue(config.rabbitmq.queue, { durable: true });
-      await this.channel.assertQueue(config.rabbitmq.dlq, { durable: true });
+      await ch.assertQueue(config.rabbitmq.queue, { durable: true });
+      await ch.assertQueue(config.rabbitmq.dlq, { durable: true });
 
-      await this.channel.prefetch(1);
+      await ch.prefetch(1);
 
       logger.info("Consumer: Connected to RabbitMQ successfully");
     } catch (error) {
@@ -42,7 +49,7 @@ export class RabbitMQConsumer {
 
     await this.channel.consume(
       config.rabbitmq.queue,
-      async (msg: amqp.ConsumeMessage | null) => {
+      async (msg: ConsumeMessage | null) => {
         if (!msg) return;
 
         try {
@@ -55,7 +62,7 @@ export class RabbitMQConsumer {
     );
   }
 
-  private async processMessage(msg: amqp.ConsumeMessage): Promise<void> {
+  private async processMessage(msg: ConsumeMessage): Promise<void> {
     if (!this.channel) return;
 
     let message: RabbitMQMessage;
@@ -149,7 +156,6 @@ export class RabbitMQConsumer {
       const customerExternalId = payload.customer.id;
       const orderExternalId = payload.order.id;
 
-      // 1) Upsert customer + haal SF Id op
       const customerSfId = await this.upsertCustomerAndGetId({
         externalId: customerExternalId,
         name: payload.customer.name,
@@ -160,7 +166,6 @@ export class RabbitMQConsumer {
         postalCode: payload.customer.postalCode,
       });
 
-      // 2) Upsert order (idempotent) + krijg id + createdNew
       const { id: orderSfId, createdNew } = await this.upsertOrder({
         externalOrderId: orderExternalId,
         total: payload.order.amount,
@@ -168,9 +173,13 @@ export class RabbitMQConsumer {
         customerSfId,
       });
 
-      // 3) Stock verminderen enkel bij "nieuw aangemaakte" order (anders dubbele decrement vermijden)
+      const items = (payload.order.items ?? []) as OrderItem[];
+
+      // Order Lines altijd "upserten" (idempotent per lijn)
+      await this.upsertOrderLines(orderSfId, orderExternalId, items);
+
+      // Stock enkel verlagen bij nieuwe order
       if (createdNew) {
-        const items = payload.order.items ?? [];
         await this.decrementStockForOrderItems(items, orderExternalId);
       } else {
         logger.info("Salesforce: Order bestond al (skip stock decrement)", {
@@ -186,6 +195,7 @@ export class RabbitMQConsumer {
         customerSfId,
         orderExternalId,
         orderSfId,
+        orderLines: items.length,
         stockDecremented: createdNew,
       });
 
@@ -216,8 +226,6 @@ export class RabbitMQConsumer {
 
     throw this.permanentError(`Onbekend event type: ${event}`);
   }
-
-  // ---------- Salesforce helpers ----------
 
   private sfInstance(): string {
     const instance = process.env.SALESFORCE_INSTANCE_URL;
@@ -263,15 +271,10 @@ export class RabbitMQConsumer {
       });
 
       const queryUrl = `${instance}/services/data/v${v}/query`;
-      const q = `SELECT Id FROM CustomerCustom__c WHERE ExternalId__c = '${this.escapeSoql(
-        input.externalId
-      )}' LIMIT 1`;
+      const q = `SELECT Id FROM CustomerCustom__c WHERE ExternalId__c = '${this.escapeSoql(input.externalId)}' LIMIT 1`;
 
       const qr = await this.sf.client.get(queryUrl, { params: { q } });
-
-      if (!qr.data.records?.length) {
-        throw this.retryableError("Customer not found after upsert", 500);
-      }
+      if (!qr.data.records?.length) throw this.retryableError("Customer not found after upsert", 500);
 
       return qr.data.records[0].Id as string;
     } catch (e: any) {
@@ -281,7 +284,6 @@ export class RabbitMQConsumer {
       if (status && status >= 400 && status < 500) {
         throw this.permanentError(`Salesforce 4xx bij customer upsert: ${JSON.stringify(data)}`, status);
       }
-
       throw this.retryableError(`Salesforce error bij customer upsert: ${JSON.stringify(data)}`, status ?? 500);
     }
   }
@@ -296,36 +298,26 @@ export class RabbitMQConsumer {
 
     const instance = this.sfInstance();
     const v = this.sfApiVersion();
-
     const queryUrl = `${instance}/services/data/v${v}/query`;
 
-    // We cannot upsert via /OrderCustom__c/ExternalOrderId__c/{value}
-    // because Salesforce returns: "Provided external ID field does not exist or is not accessible".
-    // So: idempotency by Name = externalOrderId (create-if-not-exists).
     const key = this.escapeSoql(input.externalOrderId);
     const checkQ = `SELECT Id FROM OrderCustom__c WHERE Name = '${key}' LIMIT 1`;
 
     try {
-      // 1) Check if exists
       const existing = await this.sf.client.get(queryUrl, { params: { q: checkQ } });
       const rec = existing.data.records?.[0];
 
       if (rec?.Id) {
-        // Update fields (optional but nice)
         const updateUrl = `${instance}/services/data/v${v}/sobjects/OrderCustom__c/${encodeURIComponent(rec.Id)}`;
-
         await this.sf.client.patch(updateUrl, {
           Total__c: input.total,
           Status__c: input.status,
           CustomerC__c: input.customerSfId,
         });
-
         return { id: rec.Id as string, createdNew: false };
       }
 
-      // 2) Create new
       const createUrl = `${instance}/services/data/v${v}/sobjects/OrderCustom__c`;
-
       const created = await this.sf.client.post(createUrl, {
         Name: input.externalOrderId,
         Total__c: input.total,
@@ -334,18 +326,11 @@ export class RabbitMQConsumer {
       });
 
       const newId = created?.data?.id as string | undefined;
+      if (newId) return { id: newId, createdNew: true };
 
-      if (newId) {
-        return { id: newId, createdNew: true };
-      }
-
-      // fallback: query again
       const qr = await this.sf.client.get(queryUrl, { params: { q: checkQ } });
       const rec2 = qr.data.records?.[0];
-
-      if (!rec2?.Id) {
-        throw this.retryableError("Order not found after create", 500);
-      }
+      if (!rec2?.Id) throw this.retryableError("Order not found after create", 500);
 
       return { id: rec2.Id as string, createdNew: true };
     } catch (e: any) {
@@ -355,12 +340,105 @@ export class RabbitMQConsumer {
       if (status && status >= 400 && status < 500) {
         throw this.permanentError(`Salesforce 4xx bij order create/check: ${JSON.stringify(data)}`, status);
       }
-
       throw this.retryableError(`Salesforce error bij order create/check: ${JSON.stringify(data)}`, status ?? 500);
     }
   }
 
-  private async findProductByExternalProductId(externalProductId: string): Promise<{ id: string; stock: number; name?: string }> {
+  // Order Line object + fields (volgens jouw screenshots):
+  // Object: OrderLineCustom__c
+  // Lookup naar Order: Order_c__c
+  // External Product Id: ExternalProductId_c__c
+  // Quantity: Quantity_c__c
+  // Price: Price_c__c
+  // Name: standaard Name
+  private async upsertOrderLines(orderSfId: string, orderExternalId: string, items: OrderItem[]): Promise<void> {
+    if (!Array.isArray(items) || items.length === 0) return;
+
+    await this.sf.authenticate();
+
+    const instance = this.sfInstance();
+    const v = this.sfApiVersion();
+    const queryUrl = `${instance}/services/data/v${v}/query`;
+    const sobjectUrl = `${instance}/services/data/v${v}/sobjects/OrderLineCustom__c`;
+
+    for (const item of items) {
+      const externalProductId = String(item.productId);
+      const qty = Number(item.quantity ?? 0);
+      const price = Number(item.price ?? 0);
+
+      if (!externalProductId || !qty || qty <= 0) {
+        throw this.permanentError(`Ongeldig order item (productId/quantity): ${JSON.stringify(item)}`, 400);
+      }
+
+      // Idempotency sleutel per order + product
+      const lineKey = `${orderExternalId}:${externalProductId}`;
+      const checkQ = `
+        SELECT Id
+        FROM OrderLineCustom__c
+        WHERE Name = '${this.escapeSoql(lineKey)}'
+        LIMIT 1
+      `;
+
+      try {
+        const existing = await this.sf.client.get(queryUrl, { params: { q: checkQ } });
+        const rec = existing.data.records?.[0];
+
+        if (rec?.Id) {
+          const updateUrl = `${sobjectUrl}/${encodeURIComponent(rec.Id)}`;
+          await this.sf.client.patch(updateUrl, {
+            Order_c__c: orderSfId,
+            ExternalProductId_c__c: externalProductId,
+            Quantity_c__c: qty,
+            Price_c__c: price,
+          });
+
+          logger.info("Salesforce: Order line updated", {
+            orderExternalId,
+            orderSfId,
+            lineKey,
+            orderLineSfId: rec.Id,
+            externalProductId,
+            qty,
+            price,
+          });
+
+          continue;
+        }
+
+        const created = await this.sf.client.post(sobjectUrl, {
+          Name: lineKey,
+          Order_c__c: orderSfId,
+          ExternalProductId_c__c: externalProductId,
+          Quantity_c__c: qty,
+          Price_c__c: price,
+        });
+
+        const newId = created?.data?.id as string | undefined;
+
+        logger.info("Salesforce: Order line created", {
+          orderExternalId,
+          orderSfId,
+          lineKey,
+          orderLineSfId: newId,
+          externalProductId,
+          qty,
+          price,
+        });
+      } catch (e: any) {
+        const status = e?.response?.status;
+        const data = e?.response?.data ?? e?.message;
+
+        if (status && status >= 400 && status < 500) {
+          throw this.permanentError(`Salesforce 4xx bij order line upsert: ${JSON.stringify(data)}`, status);
+        }
+        throw this.retryableError(`Salesforce error bij order line upsert: ${JSON.stringify(data)}`, status ?? 500);
+      }
+    }
+  }
+
+  private async findProductByExternalProductId(
+    externalProductId: string
+  ): Promise<{ id: string; stock: number; name?: string }> {
     await this.sf.authenticate();
 
     const instance = this.sfInstance();
@@ -378,9 +456,7 @@ export class RabbitMQConsumer {
       const qr = await this.sf.client.get(queryUrl, { params: { q } });
       const rec = qr.data.records?.[0];
 
-      if (!rec) {
-        throw this.permanentError(`Product niet gevonden in Salesforce: ${externalProductId}`, 404);
-      }
+      if (!rec) throw this.permanentError(`Product niet gevonden in Salesforce: ${externalProductId}`, 404);
 
       return {
         id: rec.Id as string,
@@ -394,7 +470,6 @@ export class RabbitMQConsumer {
       if (status && status >= 400 && status < 500) {
         throw this.permanentError(`Salesforce 4xx bij product query: ${JSON.stringify(data)}`, status);
       }
-
       throw this.retryableError(`Salesforce error bij product query: ${JSON.stringify(data)}`, status ?? 500);
     }
   }
@@ -408,24 +483,24 @@ export class RabbitMQConsumer {
     const url = `${instance}/services/data/v${v}/sobjects/ProductCustom__c/${encodeURIComponent(productSfId)}`;
 
     try {
-      await this.sf.client.patch(url, {
-        Stock__c: newStock,
-      });
+      await this.sf.client.patch(url, { Stock__c: newStock });
     } catch (e: any) {
       const status = e?.response?.status;
 
       if (status && status >= 400 && status < 500) {
-        throw this.permanentError(`Salesforce 4xx bij product stock update: ${JSON.stringify(e?.response?.data ?? e?.message)}`, status);
+        throw this.permanentError(
+          `Salesforce 4xx bij product stock update: ${JSON.stringify(e?.response?.data ?? e?.message)}`,
+          status
+        );
       }
-
-      throw this.retryableError(`Salesforce error bij product stock update: ${JSON.stringify(e?.response?.data ?? e?.message)}`, status ?? 500);
+      throw this.retryableError(
+        `Salesforce error bij product stock update: ${JSON.stringify(e?.response?.data ?? e?.message)}`,
+        status ?? 500
+      );
     }
   }
 
-  private async decrementStockForOrderItems(
-    items: Array<{ productId: string; quantity: number; price: number; totalPrice: number; productName?: string }>,
-    orderExternalId: string
-  ): Promise<void> {
+  private async decrementStockForOrderItems(items: OrderItem[], orderExternalId: string): Promise<void> {
     if (!Array.isArray(items) || items.length === 0) return;
 
     for (const item of items) {
@@ -462,8 +537,6 @@ export class RabbitMQConsumer {
     }
   }
 
-  // ---------- Error helpers ----------
-
   private retryableError(message: string, statusCode = 500): Error {
     const err: any = new Error(message);
     err.isHerhaalbaar = true;
@@ -477,8 +550,6 @@ export class RabbitMQConsumer {
     err.statusCode = statusCode;
     return err;
   }
-
-  // ---------- DLQ / close ----------
 
   private async sendToDLQ(message: RabbitMQMessage, error: string): Promise<void> {
     if (!this.channel) return;
@@ -501,10 +572,7 @@ export class RabbitMQConsumer {
   async close(): Promise<void> {
     try {
       if (this.channel) await this.channel.close();
-      if (this.connection) {
-        // @ts-ignore
-        await this.connection.close();
-      }
+      if (this.connection) await this.connection.close();
       logger.info("Consumer: RabbitMQ connection closed");
     } catch (error) {
       logger.error("Consumer: Error closing RabbitMQ connection", { error });
