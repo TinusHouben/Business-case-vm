@@ -1,3 +1,4 @@
+// src/api/server.ts
 import express, { Request, Response } from 'express';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
@@ -6,12 +7,10 @@ import { RabbitMQMessage, EventType, MessagePayload } from '../types/message';
 import { config, validateConfig } from '../config';
 import logger from '../utils/logger';
 import { CANDIES, getCandyById } from '../data/candies';
+import { getProducts, getProductByExternalProductId } from '../services/salesforce-products-service';
 
 const app = express();
 
-/**
- * ✅ CORS: sta enkel jouw frontend(s) toe
- */
 const allowedOrigins = [
   'http://localhost:5173',
   'http://localhost:5174',
@@ -24,9 +23,8 @@ const allowedOrigins = [
 app.use(
   cors({
     origin: (origin, cb) => {
-      if (!origin) return cb(null, true); // curl/postman
+      if (!origin) return cb(null, true);
       if (allowedOrigins.includes(origin)) return cb(null, true);
-
       logger.warn('CORS blocked origin', { origin });
       return cb(new Error('Not allowed by CORS'));
     },
@@ -46,7 +44,7 @@ producer.connect().catch((error) => {
   process.exit(1);
 });
 
-app.get('/', (req: Request, res: Response) => {
+app.get('/', (_req: Request, res: Response) => {
   res.json({
     service: 'Snoepjes Winkel - RabbitMQ Salesforce Integration',
     version: '1.0.0',
@@ -55,6 +53,7 @@ app.get('/', (req: Request, res: Response) => {
       health: 'GET /health',
       queueInfo: 'GET /queue/info',
       candies: 'GET /api/candies',
+      products: 'GET /api/products',
       sendMessage: 'POST /api/messages',
       createCustomer: 'POST /api/customers',
       createOrder: 'POST /api/orders',
@@ -63,11 +62,11 @@ app.get('/', (req: Request, res: Response) => {
   });
 });
 
-app.get('/health', (req: Request, res: Response) => {
+app.get('/health', (_req: Request, res: Response) => {
   res.json({ status: 'ok', service: 'producer-api' });
 });
 
-app.get('/queue/info', async (req: Request, res: Response) => {
+app.get('/queue/info', async (_req: Request, res: Response) => {
   try {
     const queueInfo = await producer.getQueueInfo();
     res.json(queueInfo);
@@ -77,7 +76,7 @@ app.get('/queue/info', async (req: Request, res: Response) => {
   }
 });
 
-app.get('/api/candies', (req: Request, res: Response) => {
+app.get('/api/candies', (_req: Request, res: Response) => {
   try {
     res.json({
       success: true,
@@ -90,9 +89,28 @@ app.get('/api/candies', (req: Request, res: Response) => {
   }
 });
 
-/**
- * Generic message endpoint (blijft bruikbaar voor testing)
- */
+app.get('/api/products', async (_req: Request, res: Response) => {
+  try {
+    const products = await getProducts();
+    res.json({
+      success: true,
+      products,
+      total: products.length,
+    });
+  } catch (e: any) {
+    const status = e?.response?.status;
+    const data = e?.response?.data;
+    const url = e?.config?.url;
+
+    logger.error('Failed to fetch products', { status, url, data, msg: e?.message });
+
+    res.status(500).json({
+      error: e?.message,
+      sf: { status, url, data },
+    });
+  }
+});
+
 app.post('/api/messages', async (req: Request, res: Response) => {
   try {
     const { event, payload } = req.body;
@@ -140,9 +158,6 @@ app.post('/api/messages', async (req: Request, res: Response) => {
   }
 });
 
-/**
- * CREATE_CUSTOMER
- */
 app.post('/api/customers', async (req: Request, res: Response) => {
   try {
     const { id, name, email, phone, address, city, postalCode } = req.body;
@@ -192,11 +207,6 @@ app.post('/api/customers', async (req: Request, res: Response) => {
   }
 });
 
-/**
- * ✅ CREATE_ORDER
- * BELANGRIJK: payload.customer is getypeerd met verplichte name+email
- * -> dus we eisen hier ook name+email in de body
- */
 app.post('/api/orders', async (req: Request, res: Response) => {
   try {
     const { id, customerId, amount, currency, items, customer } = req.body;
@@ -207,7 +217,6 @@ app.post('/api/orders', async (req: Request, res: Response) => {
       });
     }
 
-    // ✅ enforce customer info (minstens name+email) zodat TS type klopt en consumer niet faalt
     if (!customer || !customer.name || !customer.email) {
       return res.status(400).json({
         error: 'Missing required customer fields for CREATE_ORDER: customer.name, customer.email',
@@ -260,9 +269,6 @@ app.post('/api/orders', async (req: Request, res: Response) => {
   }
 });
 
-/**
- * Candy checkout endpoint (frontend flow)
- */
 app.post('/api/orders/candy', async (req: Request, res: Response) => {
   try {
     const { basket, customerInfo } = req.body;
@@ -298,32 +304,55 @@ app.post('/api/orders/candy', async (req: Request, res: Response) => {
         });
       }
 
-      const candy = getCandyById(candyId);
-      if (!candy) {
-        return res.status(400).json({
-          error: `Candy not found: ${candyId}`,
+      const sfProduct = await getProductByExternalProductId(String(candyId));
+
+      let productName: string;
+      let pricePer100g: number;
+      let stock: number | null;
+
+      if (sfProduct) {
+        productName = sfProduct.name;
+        pricePer100g = sfProduct.price;
+        stock = sfProduct.stock;
+      } else {
+        const candy = getCandyById(candyId);
+        if (!candy) {
+          return res.status(400).json({
+            error: `Product not found in Salesforce or local list: ${candyId}`,
+          });
+        }
+        productName = candy.name;
+        pricePer100g = candy.pricePer100g;
+        stock = null;
+      }
+
+      if (stock !== null && stock < quantity) {
+        return res.status(409).json({
+          error: `Not enough stock for product: ${candyId}`,
+          details: {
+            externalProductId: candyId,
+            requested: quantity,
+            available: stock,
+          },
         });
       }
 
-      const itemTotalPrice = candy.pricePer100g * quantity;
+      const itemTotalPrice = pricePer100g * quantity;
       totalAmount += itemTotalPrice;
 
       orderItems.push({
-        productId: candy.id,
-        productName: candy.name,
+        productId: String(candyId),
+        productName,
         quantity,
-        price: candy.pricePer100g,
+        price: pricePer100g,
         totalPrice: itemTotalPrice,
       });
     }
 
-const orderId = `ORD-${Date.now()}-${uuidv4().substring(0, 8)}`;
+    const orderId = `ORD-${Date.now()}-${uuidv4().substring(0, 8)}`;
+    const emailKey = String(customerInfo.email).trim().toLowerCase();
+    const customerId = customerInfo.customerId || `EMAIL:${emailKey}`;
 
-// ✅ Deterministische customerId op basis van email => geen duplicates
-const emailKey = String(customerInfo.email).trim().toLowerCase();
-const customerId = customerInfo.customerId || `EMAIL:${emailKey}`;
-
-    // ✅ Als klant nog geen customerId heeft: stuur CREATE_CUSTOMER
     if (!customerInfo.customerId) {
       const customerMessage: RabbitMQMessage = {
         messageId: uuidv4(),
@@ -346,7 +375,6 @@ const customerId = customerInfo.customerId || `EMAIL:${emailKey}`;
       logger.info('API: Customer creation message sent', { customerId });
     }
 
-    // ✅ payload.customer (top-level) zodat consumer kan upserten
     const orderMessage: RabbitMQMessage = {
       messageId: uuidv4(),
       event: EventType.CREATE_ORDER,
@@ -415,7 +443,6 @@ process.on('SIGINT', async () => {
 validateConfig();
 const PORT = config.api.port || 3000;
 
-// ✅ luister extern (VM IP bereikbaar)
 app.listen(PORT, '0.0.0.0', () => {
   logger.info(`Producer API server running on port ${PORT}`);
   console.log(`\nProducer API Server running on http://0.0.0.0:${PORT}`);
