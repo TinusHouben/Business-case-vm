@@ -297,40 +297,66 @@ export class RabbitMQConsumer {
     const instance = this.sfInstance();
     const v = this.sfApiVersion();
 
-    const upsertUrl = `${instance}/services/data/v${v}/sobjects/OrderCustom__c/ExternalOrderId__c/${encodeURIComponent(
-      input.externalOrderId
-    )}`;
+    const queryUrl = `${instance}/services/data/v${v}/query`;
+
+    // We cannot upsert via /OrderCustom__c/ExternalOrderId__c/{value}
+    // because Salesforce returns: "Provided external ID field does not exist or is not accessible".
+    // So: idempotency by Name = externalOrderId (create-if-not-exists).
+    const key = this.escapeSoql(input.externalOrderId);
+    const checkQ = `SELECT Id FROM OrderCustom__c WHERE Name = '${key}' LIMIT 1`;
 
     try {
-      const res = await this.sf.client.patch(upsertUrl, {
+      // 1) Check if exists
+      const existing = await this.sf.client.get(queryUrl, { params: { q: checkQ } });
+      const rec = existing.data.records?.[0];
+
+      if (rec?.Id) {
+        // Update fields (optional but nice)
+        const updateUrl = `${instance}/services/data/v${v}/sobjects/OrderCustom__c/${encodeURIComponent(rec.Id)}`;
+
+        await this.sf.client.patch(updateUrl, {
+          Total__c: input.total,
+          Status__c: input.status,
+          CustomerC__c: input.customerSfId,
+        });
+
+        return { id: rec.Id as string, createdNew: false };
+      }
+
+      // 2) Create new
+      const createUrl = `${instance}/services/data/v${v}/sobjects/OrderCustom__c`;
+
+      const created = await this.sf.client.post(createUrl, {
+        Name: input.externalOrderId,
         Total__c: input.total,
         Status__c: input.status,
         CustomerC__c: input.customerSfId,
-        // ExternalOrderId__c niet nodig in body (zit in URL)
       });
 
-      const createdNew = res.status === 201;
+      const newId = created?.data?.id as string | undefined;
 
-      const queryUrl = `${instance}/services/data/v${v}/query`;
-      const q = `SELECT Id FROM OrderCustom__c WHERE ExternalOrderId__c = '${this.escapeSoql(
-        input.externalOrderId
-      )}' LIMIT 1`;
-
-      const qr = await this.sf.client.get(queryUrl, { params: { q } });
-
-      if (!qr.data.records?.length) {
-        throw this.retryableError("Order not found after upsert", 500);
+      if (newId) {
+        return { id: newId, createdNew: true };
       }
 
-      return { id: qr.data.records[0].Id as string, createdNew };
+      // fallback: query again
+      const qr = await this.sf.client.get(queryUrl, { params: { q: checkQ } });
+      const rec2 = qr.data.records?.[0];
+
+      if (!rec2?.Id) {
+        throw this.retryableError("Order not found after create", 500);
+      }
+
+      return { id: rec2.Id as string, createdNew: true };
     } catch (e: any) {
       const status = e?.response?.status;
+      const data = e?.response?.data ?? e?.message;
 
       if (status && status >= 400 && status < 500) {
-        throw this.permanentError(`Salesforce 4xx bij order upsert: ${JSON.stringify(e?.response?.data ?? e?.message)}`, status);
+        throw this.permanentError(`Salesforce 4xx bij order create/check: ${JSON.stringify(data)}`, status);
       }
 
-      throw this.retryableError(`Salesforce error bij order upsert: ${JSON.stringify(e?.response?.data ?? e?.message)}`, status ?? 500);
+      throw this.retryableError(`Salesforce error bij order create/check: ${JSON.stringify(data)}`, status ?? 500);
     }
   }
 
