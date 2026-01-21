@@ -8,7 +8,35 @@ import logger from '../utils/logger';
 import { CANDIES, getCandyById } from '../data/candies';
 
 const app = express();
-app.use(cors());
+
+/**
+ * ✅ CORS: sta enkel jouw frontend(s) toe
+ */
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:5175',
+  'http://10.2.160.225:5173',
+  'http://10.2.160.225:5174',
+  'http://10.2.160.225:5175',
+];
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin) return cb(null, true); // curl/postman
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+
+      logger.warn('CORS blocked origin', { origin });
+      return cb(new Error('Not allowed by CORS'));
+    },
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-API-KEY'],
+    credentials: true,
+  })
+);
+
+app.options('*', cors());
 app.use(express.json());
 
 const producer = new RabbitMQProducer();
@@ -62,6 +90,9 @@ app.get('/api/candies', (req: Request, res: Response) => {
   }
 });
 
+/**
+ * Generic message endpoint (blijft bruikbaar voor testing)
+ */
 app.post('/api/messages', async (req: Request, res: Response) => {
   try {
     const { event, payload } = req.body;
@@ -92,26 +123,29 @@ app.post('/api/messages', async (req: Request, res: Response) => {
         messageId: message.messageId,
         event: message.event,
       });
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
         messageId: message.messageId,
         message: 'Message sent to queue',
         data: message,
       });
-    } else {
-      res.status(503).json({
-        error: 'Failed to send message (queue may be full)',
-      });
     }
+
+    return res.status(503).json({
+      error: 'Failed to send message (queue may be full)',
+    });
   } catch (error: any) {
     logger.error('API: Failed to send message', { error: error.message });
     res.status(500).json({ error: error.message });
   }
 });
 
+/**
+ * CREATE_CUSTOMER
+ */
 app.post('/api/customers', async (req: Request, res: Response) => {
   try {
-    const { id, name, email, phone } = req.body;
+    const { id, name, email, phone, address, city, postalCode } = req.body;
 
     if (!id || !name || !email) {
       return res.status(400).json({
@@ -128,6 +162,9 @@ app.post('/api/customers', async (req: Request, res: Response) => {
           name,
           email,
           phone,
+          address,
+          city,
+          postalCode,
         },
       },
       timestamp: new Date().toISOString(),
@@ -136,17 +173,17 @@ app.post('/api/customers', async (req: Request, res: Response) => {
     const sent = await producer.sendMessage(message);
 
     if (sent) {
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
         messageId: message.messageId,
         message: 'Customer creation message sent',
         data: message,
       });
-    } else {
-      res.status(503).json({
-        error: 'Failed to send message',
-      });
     }
+
+    return res.status(503).json({
+      error: 'Failed to send message',
+    });
   } catch (error: any) {
     logger.error('API: Failed to create customer message', {
       error: error.message,
@@ -155,9 +192,14 @@ app.post('/api/customers', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * ✅ CREATE_ORDER
+ * BELANGRIJK: payload.customer is getypeerd met verplichte name+email
+ * -> dus we eisen hier ook name+email in de body
+ */
 app.post('/api/orders', async (req: Request, res: Response) => {
   try {
-    const { id, customerId, amount, currency, items } = req.body;
+    const { id, customerId, amount, currency, items, customer } = req.body;
 
     if (!id || !customerId || !amount || !items) {
       return res.status(400).json({
@@ -165,10 +207,26 @@ app.post('/api/orders', async (req: Request, res: Response) => {
       });
     }
 
+    // ✅ enforce customer info (minstens name+email) zodat TS type klopt en consumer niet faalt
+    if (!customer || !customer.name || !customer.email) {
+      return res.status(400).json({
+        error: 'Missing required customer fields for CREATE_ORDER: customer.name, customer.email',
+      });
+    }
+
     const message: RabbitMQMessage = {
       messageId: uuidv4(),
       event: EventType.CREATE_ORDER,
       payload: {
+        customer: {
+          id: customerId,
+          name: customer.name,
+          email: customer.email,
+          phone: customer.phone,
+          address: customer.address,
+          city: customer.city,
+          postalCode: customer.postalCode,
+        },
         order: {
           id,
           customerId,
@@ -183,17 +241,17 @@ app.post('/api/orders', async (req: Request, res: Response) => {
     const sent = await producer.sendMessage(message);
 
     if (sent) {
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
         messageId: message.messageId,
         message: 'Order creation message sent',
         data: message,
       });
-    } else {
-      res.status(503).json({
-        error: 'Failed to send message',
-      });
     }
+
+    return res.status(503).json({
+      error: 'Failed to send message',
+    });
   } catch (error: any) {
     logger.error('API: Failed to create order message', {
       error: error.message,
@@ -202,6 +260,9 @@ app.post('/api/orders', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * Candy checkout endpoint (frontend flow)
+ */
 app.post('/api/orders/candy', async (req: Request, res: Response) => {
   try {
     const { basket, customerInfo } = req.body;
@@ -218,7 +279,6 @@ app.post('/api/orders/candy', async (req: Request, res: Response) => {
       });
     }
 
-    // Valideer en bereken order items
     const orderItems: Array<{
       productId: string;
       productName: string;
@@ -226,6 +286,7 @@ app.post('/api/orders/candy', async (req: Request, res: Response) => {
       price: number;
       totalPrice: number;
     }> = [];
+
     let totalAmount = 0;
 
     for (const basketItem of basket) {
@@ -244,24 +305,25 @@ app.post('/api/orders/candy', async (req: Request, res: Response) => {
         });
       }
 
-      // Quantity is in 100g units
       const itemTotalPrice = candy.pricePer100g * quantity;
       totalAmount += itemTotalPrice;
 
       orderItems.push({
         productId: candy.id,
         productName: candy.name,
-        quantity: quantity, // aantal keer 100g
+        quantity,
         price: candy.pricePer100g,
         totalPrice: itemTotalPrice,
       });
     }
 
-    // Genereer order ID
-    const orderId = `ORD-${Date.now()}-${uuidv4().substring(0, 8)}`;
-    const customerId = customerInfo.customerId || `CUST-${Date.now()}-${uuidv4().substring(0, 8)}`;
+const orderId = `ORD-${Date.now()}-${uuidv4().substring(0, 8)}`;
 
-    // Maak eerst customer aan als die nog niet bestaat
+// ✅ Deterministische customerId op basis van email => geen duplicates
+const emailKey = String(customerInfo.email).trim().toLowerCase();
+const customerId = customerInfo.customerId || `EMAIL:${emailKey}`;
+
+    // ✅ Als klant nog geen customerId heeft: stuur CREATE_CUSTOMER
     if (!customerInfo.customerId) {
       const customerMessage: RabbitMQMessage = {
         messageId: uuidv4(),
@@ -284,25 +346,26 @@ app.post('/api/orders/candy', async (req: Request, res: Response) => {
       logger.info('API: Customer creation message sent', { customerId });
     }
 
-    // Maak order aan
+    // ✅ payload.customer (top-level) zodat consumer kan upserten
     const orderMessage: RabbitMQMessage = {
       messageId: uuidv4(),
       event: EventType.CREATE_ORDER,
       payload: {
+        customer: {
+          id: customerId,
+          name: customerInfo.name,
+          email: customerInfo.email,
+          phone: customerInfo.phone,
+          address: customerInfo.address,
+          city: customerInfo.city,
+          postalCode: customerInfo.postalCode,
+        },
         order: {
           id: orderId,
-          customerId: customerId,
-          amount: Math.round(totalAmount * 100) / 100, // Rond af op 2 decimalen
+          customerId,
+          amount: Math.round(totalAmount * 100) / 100,
           currency: 'EUR',
           items: orderItems,
-          customerInfo: {
-            name: customerInfo.name,
-            email: customerInfo.email,
-            phone: customerInfo.phone,
-            address: customerInfo.address,
-            city: customerInfo.city,
-            postalCode: customerInfo.postalCode,
-          },
         },
       },
       timestamp: new Date().toISOString(),
@@ -311,7 +374,7 @@ app.post('/api/orders/candy', async (req: Request, res: Response) => {
     const sent = await producer.sendMessage(orderMessage);
 
     if (sent) {
-      res.status(201).json({
+      return res.status(201).json({
         success: true,
         messageId: orderMessage.messageId,
         message: 'Candy order created successfully',
@@ -324,11 +387,11 @@ app.post('/api/orders/candy', async (req: Request, res: Response) => {
           customerInfo,
         },
       });
-    } else {
-      res.status(503).json({
-        error: 'Failed to send order message',
-      });
     }
+
+    return res.status(503).json({
+      error: 'Failed to send order message',
+    });
   } catch (error: any) {
     logger.error('API: Failed to create candy order', {
       error: error.message,
@@ -350,11 +413,13 @@ process.on('SIGINT', async () => {
 });
 
 validateConfig();
-const PORT = config.api.port;
-app.listen(PORT, () => {
+const PORT = config.api.port || 3000;
+
+// ✅ luister extern (VM IP bereikbaar)
+app.listen(PORT, '0.0.0.0', () => {
   logger.info(`Producer API server running on port ${PORT}`);
-  console.log(`\nProducer API Server running on http://localhost:${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Queue info: http://localhost:${PORT}/queue/info`);
-  console.log(`Send message: POST http://localhost:${PORT}/api/messages\n`);
+  console.log(`\nProducer API Server running on http://0.0.0.0:${PORT}`);
+  console.log(`Health check: http://10.2.160.225:${PORT}/health`);
+  console.log(`Queue info: http://10.2.160.225:${PORT}/queue/info`);
+  console.log(`Send message: POST http://10.2.160.225:${PORT}/api/messages\n`);
 });

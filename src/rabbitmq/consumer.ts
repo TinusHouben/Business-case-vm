@@ -1,10 +1,9 @@
-// src/rabbitmq/consumer.ts  (pas het pad aan als jouw project een andere mapnaam gebruikt)
+// src/rabbitmq/consumer.ts
 import * as amqp from "amqplib";
 import { RabbitMQMessage, EventType } from "../types/message";
 import { config } from "../config";
 import logger from "../utils/logger";
 import { isMessageProcessed, markMessageProcessed } from "../utils/idempotency";
-
 import { SalesforceRefreshService } from "../services/salesforce-refresh";
 
 /**
@@ -159,15 +158,18 @@ export class RabbitMQConsumer {
       const customerExternalId = payload.customer.id;
       const orderExternalId = payload.order.id;
 
-      // 1) Upsert customer + haal SF Id op
+      // 1) Upsert customer + haal SF Id op (incl. address/city/postalCode)
       const customerSfId = await this.upsertCustomerAndGetId({
         externalId: customerExternalId,
         name: payload.customer.name,
         email: payload.customer.email,
         phone: payload.customer.phone,
+        address: payload.customer.address,
+        city: payload.customer.city,
+        postalCode: payload.customer.postalCode,
       });
 
-      // 2) Create order + link CustomerC__c
+      // 2) Create order + link CustomerC__c (lookup field op OrderCustom__c)
       const orderSfId = await this.createOrder({
         externalOrderId: orderExternalId,
         total: payload.order.amount,
@@ -186,7 +188,7 @@ export class RabbitMQConsumer {
       return;
     }
 
-    // Customer-only events (optioneel): enkel customer upsert
+    // Customer-only events (optioneel): enkel customer upsert (incl. address/city/postalCode)
     if (event === EventType.CREATE_CUSTOMER || event === EventType.UPDATE_CUSTOMER) {
       if (!payload.customer) throw this.permanentError("payload.customer ontbreekt");
 
@@ -195,6 +197,9 @@ export class RabbitMQConsumer {
         name: payload.customer.name,
         email: payload.customer.email,
         phone: payload.customer.phone,
+        address: payload.customer.address,
+        city: payload.customer.city,
+        postalCode: payload.customer.postalCode,
       });
 
       logger.info("Salesforce: Customer synced", {
@@ -218,7 +223,8 @@ export class RabbitMQConsumer {
   }
 
   private sfApiVersion(): string {
-    return process.env.SALESFORCE_API_VERSION ?? "60.0";
+    const raw = process.env.SALESFORCE_API_VERSION ?? "60.0";
+    return raw.replace(/^v/i, ""); // "v60.0" -> "60.0"
   }
 
   private async upsertCustomerAndGetId(input: {
@@ -226,6 +232,9 @@ export class RabbitMQConsumer {
     name: string;
     email: string;
     phone?: string;
+    address?: string;
+    city?: string;
+    postalCode?: string;
   }): Promise<string> {
     await this.sf.authenticate();
 
@@ -236,24 +245,47 @@ export class RabbitMQConsumer {
       input.externalId
     )}`;
 
-    // IMPORTANT: ExternalId__c NIET in body (want zit al in URL)
-    await this.sf.client.patch(upsertUrl, {
-      Name: input.name,
-      Email__c: input.email,
-      Phone__c: input.phone ?? null,
-    });
+    // DEBUG: toon exacte URL die we patchen (mag je later verwijderen)
+    logger.info("SF DEBUG upsertUrl", { instance, v, upsertUrl });
 
-    const queryUrl = `${instance}/services/data/v${v}/query`;
-    const q = `SELECT Id FROM CustomerCustom__c WHERE ExternalId__c = '${input.externalId}' LIMIT 1`;
+    try {
+      // IMPORTANT: ExternalId__c NIET in body (want zit al in URL)
+      // ⚠️ PAS deze field API names aan als jouw velden anders heten in Salesforce
+      await this.sf.client.patch(upsertUrl, {
+        Name: input.name,
+        Email__c: input.email,
+        Phone__c: input.phone ?? null,
+        Address__c: input.address ?? null,
+        City__c: input.city ?? null,
+        Postal_Code__c: input.postalCode ?? null,
+      });
 
-    const qr = await this.sf.client.get(queryUrl, { params: { q } });
+      const queryUrl = `${instance}/services/data/v${v}/query`;
+      const q = `SELECT Id FROM CustomerCustom__c WHERE ExternalId__c = '${input.externalId}' LIMIT 1`;
 
-    if (!qr.data.records?.length) {
-      // zou niet mogen, maar dan is het een herhaalbare fout (Salesforce hiccup)
-      throw this.retryableError("Customer not found after upsert", 500);
+      const qr = await this.sf.client.get(queryUrl, { params: { q } });
+
+      if (!qr.data.records?.length) {
+        throw this.retryableError("Customer not found after upsert", 500);
+      }
+
+      return qr.data.records[0].Id as string;
+    } catch (e: any) {
+      const status = e?.response?.status;
+      const data = e?.response?.data ?? e?.message;
+
+      if (status && status >= 400 && status < 500) {
+        throw this.permanentError(
+          `Salesforce 4xx bij customer upsert: ${JSON.stringify(data)}`,
+          status
+        );
+      }
+
+      throw this.retryableError(
+        `Salesforce error bij customer upsert: ${JSON.stringify(data)}`,
+        status ?? 500
+      );
     }
-
-    return qr.data.records[0].Id as string;
   }
 
   private async createOrder(input: {
@@ -267,7 +299,7 @@ export class RabbitMQConsumer {
     const instance = this.sfInstance();
     const v = this.sfApiVersion();
 
-    const createUrl = `${instance}/services/data/v${v}/sobjects/OrderCustom__c`;
+    const createUrl = `${instance}/services/data/v${v}/sobjects/OrderCustom__c/`;
 
     try {
       const res = await this.sf.client.post(createUrl, {
@@ -283,11 +315,9 @@ export class RabbitMQConsumer {
 
       return res.data.id as string;
     } catch (e: any) {
-      // Duplicates / validation = permanent; 5xx / network = retryable
       const status = e?.response?.status;
 
       if (status && status >= 400 && status < 500) {
-        // vaak: INVALID_FIELD, REQUIRED_FIELD_MISSING, etc.
         throw this.permanentError(
           `Salesforce 4xx bij order create: ${JSON.stringify(e?.response?.data ?? e?.message)}`,
           status
